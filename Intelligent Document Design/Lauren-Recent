@@ -1,0 +1,141 @@
+import os
+import boto3
+import json
+import time
+import re
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Initialize AWS clients
+aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+aws_region = os.getenv("AWS_REGION")
+
+s3 = boto3.client('s3', aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key)
+textract = boto3.client('textract', aws_access_key_id=aws_access_key_id, aws_secret_access_key=aws_secret_access_key, region_name=aws_region)
+
+def textract_extract_text(bucket, object_key):
+    """Extracts text from JPG and PDF files using AWS Textract."""
+    try:
+        file_extension = object_key.split('.')[-1].lower()
+
+        if file_extension in ['png', 'jpg', 'jpeg']:  # Handle image files
+            response = textract.analyze_document(
+                Document={'S3Object': {'Bucket': bucket, 'Name': object_key}},
+                FeatureTypes=["FORMS"]
+            )
+        elif file_extension == 'pdf':  # Handle PDFs asynchronously
+            response = textract.start_document_analysis(
+                DocumentLocation={'S3Object': {'Bucket': bucket, 'Name': object_key}},
+                FeatureTypes=["FORMS"]
+            )
+            job_id = response['JobId']
+            print(f"Started asynchronous job for PDF with JobId: {job_id}")
+
+            # Wait for Textract job completion
+            while True:
+                result = textract.get_document_analysis(JobId=job_id)
+                status = result['JobStatus']
+                if status in ['SUCCEEDED', 'FAILED']:
+                    break
+                print("Waiting for Textract to complete the analysis...")
+                time.sleep(5)
+
+            if status == 'SUCCEEDED':
+                response = result
+            else:
+                raise ValueError("Textract document analysis failed.")
+
+        else:
+            raise ValueError(f"Unsupported file format: {file_extension}")
+
+        return response  # Return the extracted Textract response
+
+    except Exception as e:
+        print(f"Error in textract_extract_text: {e}")
+        return None
+
+def get_s3_bucket_object(bucket):
+    """Retrieves the most recent object from the S3 bucket."""
+    paginator = s3.get_paginator('list_objects_v2')
+    operation_parameters = {'Bucket': bucket}
+    page_iterator = paginator.paginate(**operation_parameters)
+
+    object_keys = []
+    for page in page_iterator:
+        if 'Contents' in page and page['Contents']:
+            object_keys.extend([item['Key'] for item in page['Contents']])
+    
+    return object_keys[19] if object_keys else None  # Get the most recent file
+
+def structure_text(response):
+    """Extracts structured text from AWS Textract response."""
+    text = ""
+    blocks = response.get('Blocks', [])
+
+    for block in blocks:
+        if block['BlockType'] in ['WORD', 'LINE']:
+            text += block.get('Text', '') + '\n'
+
+    return text.strip()  # Return the extracted text
+
+def extract_details(text):
+    """Extracts Date, Signed by Customer, and Customer Name."""
+    details = {
+        "Date": "Not Found",
+        "Signed by Customer": "Not Found",
+        "Customer Name": "Not Found"
+    }
+
+    # Date format: MM/DD/YYYY HH:MM CMT
+    date_pattern = r'\b(\d{1,2}/\d{1,2}/\d{4} \d{2}:\d{2} CMT)\b'
+    match_date = re.search(date_pattern, text)
+    if match_date:
+        details["Date"] = match_date.group(1)
+
+    # Signed by Customer extraction (handles variations)
+    signed_by_pattern = r'(?:Signed by|Signature):\s*(.+)'
+    match_signed_by = re.search(signed_by_pattern, text, re.IGNORECASE)
+    if match_signed_by:
+        details["Signed by Customer"] = match_signed_by.group(1).strip()
+
+    # Customer Name extraction
+    customer_name_pattern = r'Customer Name:\s*(.+)'
+    match_customer_name = re.search(customer_name_pattern, text, re.IGNORECASE)
+    if match_customer_name:
+        details["Customer Name"] = match_customer_name.group(1).strip()
+
+    return details
+
+if __name__ == "__main__":
+    bucket_name = "capstone-intelligent-document-processing"
+    
+    object_key = get_s3_bucket_object(bucket_name)
+    
+    if object_key:
+        print(f"Processing file: {object_key}")
+
+        textract_response = textract_extract_text(bucket_name, object_key)
+        if textract_response:
+            # Extract structured text from response
+            extracted_text = structure_text(textract_response)
+
+            # Debugging: Print extracted text
+            print("\nExtracted Text:\n", extracted_text)
+
+            # Extract important details
+            extracted_info = extract_details(extracted_text)
+
+            # Convert to JSON
+            json_output = json.dumps(extracted_info, indent=4)
+            print(f"\nExtracted Information:\n{json_output}")
+
+            # Save to a file
+            with open("extracted_info.json", "w") as json_file:
+                json_file.write(json_output)
+        else:
+            print("Failed to extract text data from Textract response.")
+    else:
+        print("No documents found in the S3 bucket.")

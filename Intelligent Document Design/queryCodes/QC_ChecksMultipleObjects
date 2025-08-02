@@ -1,0 +1,106 @@
+import os
+import boto3
+import json
+from dotenv import load_dotenv
+from textractcaller.t_call import call_textract
+from textractprettyprinter.t_pretty_print import (Textract_Pretty_Print, get_string)
+import trp.trp2 as t2
+from tabulate import tabulate
+import psycopg2
+
+load_dotenv()
+
+aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+aws_region = os.getenv("AWS_REGION")
+bucket_name = 'capstone-intelligent-document-processing'
+db_endpoint = os.getenv("DB_ENDPOINT")
+db_port = os.getenv("DB_PORT")
+db_name = os.getenv("DB_NAME")
+db_user = os.getenv("DB_USER")
+db_pass = os.getenv("DB_PASS")
+
+
+s3 = boto3.client('s3',
+                  aws_access_key_id=aws_access_key_id,
+                  aws_secret_access_key=aws_secret_access_key)
+
+textract = boto3.client('textract',
+                        aws_access_key_id=aws_access_key_id,
+                        aws_secret_access_key=aws_secret_access_key,
+                        region_name=aws_region)
+
+def getObjectNames(bucket_name):
+    paginator = s3.get_paginator('list_objects_v2')
+    operation_parameters = {'Bucket': bucket_name}
+    page_iterator = paginator.paginate(**operation_parameters)
+
+    object_keys = []
+    page_iterator = iter(page_iterator)
+    
+    page = next(page_iterator, None)
+    if page and 'Contents' in page:
+        for item in page['Contents']:
+            object_keys.append(item['Key'])
+            if len(object_keys) >= 7:
+                break
+    return object_keys
+
+    # for page in page_iterator:
+    #     if 'Contents' in page:
+    #         for item in page['Contents']:
+    #             object_keys.append(item['Key'])
+    # return object_keys
+
+#if want to run this on a specific range of documents, use the code below and adjust page to
+# which of the three pages (page 1: 0-999, page 2: 1000-1999, etc.) and adjust >= 7 to the
+#number of documents you want it to grab
+
+def get_db_connection():
+    return psycopg2.connect(host=db_endpoint,
+                            port=db_port,
+                            database=db_name,
+                            user=db_user,
+                            password=db_pass,
+                            sslrootcert="SSLCERTIFICATE")
+
+
+testing = getObjectNames(bucket_name)
+connection = get_db_connection()
+cursor = connection.cursor()
+
+for docNames in testing:
+    if not docNames.endswith(".pdf"):
+        response = textract.analyze_document(
+        Document={'S3Object': {'Bucket': 'capstone-intelligent-document-processing', 'Name': (docNames)}},
+        FeatureTypes=["QUERIES"],
+        QueriesConfig={"Queries": [
+        {"Text": "What is the Client Name?", "Alias": "clientname"},
+        {"Text": "What is the Medicaid Number?", "Alias": "medicaid"},
+        {"Text": "What is the Rendering Provider Name?", "Alias": "rendname"},
+        {"Text": "What is the Rendering Provider Telephone Number?", "Alias": "renderphone"},
+        {"Text": "What is the Rendering Provider Fax Number?", "Alias": "rendfax"},
+        {"Text": "What is the Rendering Provider NPI?", "Alias": "npi"},
+        {"Text": "What is the Rendering Provider Tax ID?", "Alias": "rendtaxid"},
+        {"Text": "What is the Rendering Provider Taxonomy?", "Alias": "rendtax"},
+        {"Text": "What is the Requesting Physician Name?", "Alias": "doctorname"},
+        {"Text": "What is the Description of DME/Medical Supplies?", "Alias": "medsupply"},
+        {"Text": "What is the Qty?", "Alias": "qty"},
+        {"Text": "What is the HCPCS Code?", "Alias": "code"}
+        ]}
+        )
+
+        d = t2.TDocumentSchema().load(response)
+        page = d.pages[0]
+        query_answers = d.get_query_answers(page=page)
+        count=len(query_answers)
+        queryData={}
+
+        for i in range(count):
+            (a,b,c) = query_answers[i]
+            a = a.split("the ",1)[1]
+            a = a.split("?",1)[0]
+            queryData[a] = c
+        # json_string = json.dumps(queryData, indent=4)
+        cursor.execute("INSERT INTO documents (document_key, json) VALUES (%s, %s)",(docNames, json.dumps(queryData, indent=4)))
+        connection.commit()

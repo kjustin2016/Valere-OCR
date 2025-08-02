@@ -1,0 +1,142 @@
+import os
+import boto3
+import json
+from dotenv import load_dotenv
+from textractcaller.t_call import call_textract
+from textractprettyprinter.t_pretty_print import (Textract_Pretty_Print, get_string)
+import trp.trp2 as t2
+from tabulate import tabulate
+import re
+
+index_1 = 19
+# Place array index of S3 object here
+
+# for x in query_answers:
+#     print(f"{s3_object_name},{x[1]},{x[2]}")
+
+load_dotenv()
+
+aws_access_key_id = os.getenv("AWS_ACCESS_KEY_ID")
+aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+aws_region = os.getenv("AWS_REGION")
+
+s3 = boto3.client('s3',
+                  aws_access_key_id=aws_access_key_id,
+                  aws_secret_access_key=aws_secret_access_key)
+
+textract = boto3.client('textract',
+                        aws_access_key_id=aws_access_key_id,
+                        aws_secret_access_key=aws_secret_access_key,
+                        region_name=aws_region)
+
+def get_s3_bucket_object_by_index(index=index_1):
+    if index is None:  # Check if the index is None
+        return None  # Skip the array index search and directly go to the entity tag
+
+    paginator = s3.get_paginator('list_objects_v2')  # Paginate through the bucket
+    operation_parameters = {'Bucket': 'capstone-intelligent-document-processing'}
+    page_iterator = paginator.paginate(**operation_parameters)
+
+    # Loop through all pages and objects
+    all_object_keys = []  # Store all object keys here for debugging purposes
+    for page in page_iterator:
+        if 'Contents' in page and page['Contents']:
+            object_keys = [item['Key'] for item in page['Contents']]
+            all_object_keys.extend(object_keys)  # Collect all object keys
+
+    # Check if the index is valid
+    if len(all_object_keys) > index:
+        return all_object_keys[index]  # Return the object key at the given index
+    else:
+        print(f"Index {index} is out of range. Total objects available: {len(all_object_keys)}")
+    return None  # Return None if index is out of bounds
+
+def run_textract_queries():
+    queries = [
+        {"Text": "What is the Mother Name?", "Alias": "MOTHER_NAME"},
+        {"Text": "What is the Patient Name?", "Alias": "PATIENT_NAME"},
+        {"Text": "What is the Patient Phone Number?", "Alias": "PHONE_NUMBER"},
+        {"Text": "What is the Patient Date of Birth?", "Alias": "DOB"},
+        {"Text": "What is the Physician Name?", "Alias": "DOCTOR_NAME"},
+        {"Text": "What is the Physician Signature status?", "Alias": "PHYSICIAN_SIGNATURE"},
+        {"Text": "What is the NPI Number?", "Alias": "NPI"},
+        {"Text": "What is the Medical Necessity?", "Alias": "MEDICAL_NEED"},
+        {"Text": "What is the Infant Name?", "Alias": "INFANT_NAME"},
+        {"Text": "What is the Infant Date of Birth?", "Alias": "INFANT_DOB"}
+    ]
+
+    try:
+        response = textract.analyze_document(
+            Document={'S3Object': {'Bucket': 'capstone-intelligent-document-processing', 'Name': get_s3_bucket_object_by_index(index_1)}},
+            FeatureTypes=["QUERIES"],
+            QueriesConfig={"Queries": queries}
+        )
+        document = t2.TDocumentSchema().load(response)
+        page = document.pages[0]
+        query_answers = document.get_query_answers(page=page)
+
+        structured = {
+            "document label": "The Breast Pump Depot",
+            "data": {
+                "patient": {
+                    "Mother Name": "",
+                    "Patient Name": "",
+                    "Phone Number": "",
+                    "DOB": ""
+                },
+                "doctor": {
+                    "Doctor Name": "",
+                    "Physician Signature": "",
+                    "NPI": ""
+                },
+                "prescription": {
+                    "Medical Necessity": []  # List to store checked values
+                },
+                "infant": {
+                    "Name": "",
+                    "DOB": ""
+                }
+            }
+        }
+
+        # Process the medical necessity checkboxes and their text
+        medical_necessity_items = [
+            "Care of the lactating mother",
+            "Mother expects regular separation from infant for 10 or more hours per week",
+            "Neonatal difficulty feeding at the breast"
+        ]
+
+        for _, alias, answer in query_answers:
+            if alias == "MOTHER_NAME":
+                structured["data"]["patient"]["Mother Name"] = answer
+            elif alias == "PATIENT_NAME":
+                structured["data"]["patient"]["Patient Name"] = answer
+            elif alias == "PHONE_NUMBER":
+                structured["data"]["patient"]["Phone Number"] = answer
+            elif alias == "DOB":
+                structured["data"]["patient"]["DOB"] = answer
+            elif alias == "DOCTOR_NAME":
+                structured["data"]["doctor"]["Doctor Name"] = answer
+            elif alias == "PHYSICIAN_SIGNATURE":
+                structured["data"]["doctor"]["Physician Signature"] = answer
+            elif alias == "NPI":
+                structured["data"]["doctor"]["NPI"] = answer
+            elif alias == "MEDICAL_NEED":
+                # Look for checked items in the list of medical necessity options
+                checked_items = re.findall(r'✓\s*(.*)', answer)
+                for item in checked_items:
+                    if item in medical_necessity_items:
+                        structured["data"]["prescription"]["Medical Necessity"].append(item)
+            elif alias == "INFANT_NAME":
+                structured["data"]["infant"]["Name"] = answer
+            elif alias == "INFANT_DOB":
+                structured["data"]["infant"]["DOB"] = answer
+
+        json_string = json.dumps(structured, indent=4)
+        print(json_string)
+
+    except Exception as e:
+        print(f"Error running Textract queries: {e}")
+        return None
+    
+run_textract_queries()

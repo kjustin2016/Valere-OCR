@@ -1,0 +1,109 @@
+import boto3
+import os
+import re
+import textwrap
+from dotenv import load_dotenv
+
+search_string = 'PRESCRIPTION'  # Example: search for "PRESCRIPTION"
+# this sees if the word prescription is in the object name, not in the actual file
+# below you can specify what should be found in the actual file
+
+load_dotenv()
+
+# AWS Credentials (optional if configured via AWS CLI or environment variables)
+aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
+aws_secret_key = os.getenv("AWS_SECRET_ACCESS_KEY")
+aws_region = os.getenv("AWS_REGION")
+bucket_name = 'capstone-intelligent-document-processing'
+
+# Initialize S3 client
+s3 = boto3.client(
+    's3',
+    aws_access_key_id=aws_access_key,
+    aws_secret_access_key=aws_secret_key,
+    region_name=aws_region  # Ensure you include the region
+)
+
+textract = boto3.client('textract')
+
+def extract_first_lines_from_s3(bucket_name, object_key, num_lines=2):
+    try:
+        response = textract.analyze_document(
+            Document={'S3Object': {'Bucket': bucket_name, 'Name': object_key}},
+            FeatureTypes=["FORMS"]  # This includes the forms recognition
+        )
+        
+        # Extract text blocks from the response
+        blocks = response['Blocks']
+        
+        # Collect the first few lines
+        lines = []
+        for block in blocks:
+            if block['BlockType'] == 'LINE':  # Check if the block is a LINE
+                lines.append(block['Text'])  # Add the line to the list
+                if len(lines) >= num_lines:  # Stop once we have enough lines
+                    break
+        
+        # Return the collected lines
+        return lines if lines else ["No text found"]
+    
+    except Exception as e:
+        print(f"Error processing object {object_key}: {e}")
+        return ["Error processing document"]
+
+def get_all_object_names(bucket_name):
+    paginator = s3.get_paginator('list_objects_v2')
+    operation_parameters = {'Bucket': bucket_name}
+    page_iterator = paginator.paginate(**operation_parameters)
+
+    all_object_keys = []  # Array to store object names
+    for page in page_iterator:
+        if 'Contents' in page:
+            object_keys = [item['Key'] for item in page['Contents']]
+            all_object_keys.extend(object_keys)
+    
+    return all_object_keys
+
+def filter_objects_by_string(bucket_name, search_string):
+    object_names_array = get_all_object_names(bucket_name)
+    
+    # Initialize an empty list to store matching indices
+    matching_objects = []
+    
+    # Iterate through each object in object_names_array
+    for index, object_name in enumerate(object_names_array):
+        # Check if the object name contains the search string
+        if search_string.lower() not in object_name.lower():
+            continue  # Skip this object if it doesn't contain the search string
+        
+        # Check if the file is a PDF and skip it
+        if object_name.lower().endswith('.pdf'):
+            print(f"Skipping PDF file: {object_name}")
+            continue
+        
+        # Extract the first few lines of text from the object
+        first_lines = extract_first_lines_from_s3(bucket_name, object_name, num_lines=5)
+        
+        # Check if any of the first lines contain the word "breast"
+        if any("breast" in line.lower() for line in first_lines):
+            matching_objects.append(index)  # Store the index if it matches
+    
+    print(matching_objects)
+    output_file = 'outputSpecifiedString.txt'
+    with open(output_file, 'w') as f:
+        if matching_objects:
+            # Prepare the output string
+            output_text = f"Objects containing 'breast' in the first lines found at indices: {', '.join(map(str, matching_objects))}\n"
+        else:
+            output_text = f"No objects found with 'breast' in the first lines.\n"
+        
+        # Wrap the text to 50 characters per line
+        wrapped_text = textwrap.fill(output_text, width=50)
+        
+        # Write the wrapped text to the file
+        f.write(wrapped_text)
+    
+    return matching_objects
+
+# Call the function
+filter_objects_by_string('capstone-intelligent-document-processing', search_string)
